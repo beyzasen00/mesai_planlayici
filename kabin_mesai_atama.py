@@ -1,0 +1,583 @@
+# app.py
+# -*- coding: utf-8 -*-
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import date, datetime
+import calendar
+from pathlib import Path
+from io import BytesIO
+
+from pulp import *
+
+# ===================== GENEL AYARLAR ===================== #
+
+st.set_page_config(page_title="Mesai Planlayıcı", layout="wide")
+
+DATA_DIR = Path("C:/Users/ibrah/Desktop")
+EMP_FILE = DATA_DIR / "employees.csv"
+REQ_FILE = DATA_DIR / "requests.csv"
+ASSIGN_FILE = DATA_DIR / "assignments.csv"
+
+TAL_EP_SECENEKLERI = ["CALISABILIR", "CALISAMAZ", "YILLIK_IZIN", "EGITIM"]
+TAL_EP_DISPLAY = ["✅ Çalışabilirim", "❌ Çalışamam", "🏖️ Yıllık İzin", "📚 Eğitim"]
+
+# ===================== YARDIMCI FONKSİYONLAR ===================== #
+
+def load_employees():
+    if not EMP_FILE.exists():
+        st.error("employees.csv bulunamadı. Lütfen çalışan listesini oluştur.")
+        return pd.DataFrame(columns=["ad_soyad", "grup", "yillik_mesai_saat"])
+    df = pd.read_csv(EMP_FILE)
+    df["ad_soyad"] = df["ad_soyad"].astype(str).str.strip()
+    df["grup"] = df["grup"].astype(str).str.upper()
+    if "yillik_mesai_saat" not in df.columns:
+        df["yillik_mesai_saat"] = 0
+    return df
+
+def load_requests():
+    if not REQ_FILE.exists():
+        df = pd.DataFrame(columns=["ad_soyad", "yil", "ay", "tarih", "talep_tipi"])
+        df.to_csv(REQ_FILE, index=False)
+        return df
+    df = pd.read_csv(REQ_FILE, parse_dates=["tarih"])
+    df["ad_soyad"] = df["ad_soyad"].astype(str).str.strip()
+    return df
+
+def save_requests(df):
+    df.to_csv(REQ_FILE, index=False)
+
+def load_assignments():
+    if not ASSIGN_FILE.exists():
+        df = pd.DataFrame(columns=["ad_soyad", "yil", "ay", "tarih", "gorev_tipi"])
+        df.to_csv(ASSIGN_FILE, index=False)
+        return df
+    df = pd.read_csv(ASSIGN_FILE, parse_dates=["tarih"])
+    df["ad_soyad"] = df["ad_soyad"].astype(str).str.strip()
+    return df
+
+def save_assignments(df):
+    df.to_csv(ASSIGN_FILE, index=False)
+
+def get_all_days_of_month(year, month):
+    num_days = calendar.monthrange(year, month)[1]
+    return [date(year, month, d) for d in range(1, num_days + 1)]
+
+def auto_get_hours(d):
+    """Senin mantığını aynen aldım."""
+    if d.weekday() == 5:    # Cumartesi
+        return 4.5
+    elif d.weekday() == 6:  # Pazar
+        return 8.0
+    else:                   # Hafta içi
+        return 8.0
+
+def convert_display_to_talep(display_val):
+    """Display değerini talep_tipi'ne dönüştür"""
+    if "Çalışabilirim" in display_val:
+        return "CALISABILIR"
+    elif "Çalışamam" in display_val:
+        return "CALISAMAZ"
+    elif "Yıllık" in display_val:
+        return "YILLIK_IZIN"
+    elif "Eğitim" in display_val:
+        return "EGITIM"
+    else:
+        return "CALISABILIR"
+
+# ===================== ROL SEÇİMİ ===================== #
+
+st.sidebar.title("🗂️ Mesai Planlayıcı")
+role = st.sidebar.radio("Rolünü Seç:", ["Çalışan", "Yönetici"])
+
+# Yönetici için basit bir parola
+if role == "Yönetici":
+    pwd = st.sidebar.text_input("Yönetici şifresi", type="password")
+    if pwd != "admin123":
+        st.warning("⚠️ Yönetici ekranına erişim için doğru şifreyi gir.")
+        st.stop()
+
+employees_df = load_employees()
+
+# ===================== ÇALIŞAN MODU ===================== #
+
+if role == "Çalışan":
+    st.header("📋 Çalışan Talep Girişi")
+
+    if employees_df.empty:
+        st.error("Çalışan listesi (employees.csv) boş. Lütfen önce çalışanları tanımla.")
+        st.stop()
+
+    # Her açılışta requests_df yükle
+    requests_df = load_requests()
+
+    # İlk açılışta session state'i başlat
+    if "calisanmode_initialized" not in st.session_state:
+        st.session_state.calisanmode_initialized = True
+        st.session_state.last_selected_name = None
+        st.session_state.talep_selections = {}
+        st.session_state.current_year = None
+        st.session_state.current_month = None
+
+    # Kullanıcı kendi adını seçiyor
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        selected_name = st.selectbox("👤 Adınızı Seçiniz", employees_df["ad_soyad"].tolist(), key="selected_person_final")
+    
+    # Planlanacak dönem (basit: gelecek ay varsayılan)
+    today = date.today()
+    default_year = today.year + (1 if today.month == 12 else 0)
+    default_month = 1 if today.month == 12 else (today.month + 1)
+
+    col_y, col_m = st.columns(2)
+    with col_y:
+        year = st.number_input("📅 Yıl", min_value=2024, max_value=2100, value=default_year, step=1)
+    with col_m:
+        month = st.selectbox(
+            "📅 Ay", options=range(1, 13),
+            format_func=lambda x: calendar.month_name[x],
+            index=default_month - 1
+        )
+
+    # Kişi veya ay/yıl değiştiğinde session state'i sıfırla
+    person_changed = selected_name != st.session_state.last_selected_name
+    period_changed = (year != st.session_state.current_year) or (month != st.session_state.current_month)
+    
+    if person_changed or period_changed:
+        st.session_state.last_selected_name = selected_name
+        st.session_state.current_year = year
+        st.session_state.current_month = month
+        st.session_state.talep_selections = {}
+
+    all_days = get_all_days_of_month(year, month)
+
+    st.subheader(f"📆 {calendar.month_name[month].upper()} {year} - Talep Formu")
+    st.info("ℹ️ Takvimden her gün için durumunu seç. Varsayılan: **Çalışabilirim**")
+
+    # Bu çalışanın bu ay için daha önce girdiği talepleri çek (her seferinde yeniden yükle)
+    requests_df = load_requests()
+    existing = requests_df[
+        (requests_df["ad_soyad"] == selected_name) &
+        (requests_df["yil"] == year) &
+        (requests_df["ay"] == month)
+    ].copy()
+    existing_map = {d.date(): t for d, t in zip(existing["tarih"], existing["talep_tipi"])}
+
+    # ============ KOMPAKT TAKVİM FORMATINDA TALEP GİRİŞİ ============ #
+
+    st.markdown("### 📅 Takvim Görünümü")
+    
+    # Haftaları ayırarak takvim oluştur
+    calendar_data = []
+    current_week = []
+    
+    first_weekday = all_days[0].weekday()
+    for _ in range(first_weekday):
+        current_week.append(None)
+    
+    for day in all_days:
+        current_week.append(day)
+        if len(current_week) == 7:
+            calendar_data.append(current_week)
+            current_week = []
+    
+    if current_week:
+        while len(current_week) < 7:
+            current_week.append(None)
+        calendar_data.append(current_week)
+    
+    # Session state boşsa existing_map'ten doldur
+    if not st.session_state.talep_selections:
+        for day, talep in existing_map.items():
+            st.session_state.talep_selections[day] = talep
+    
+    day_names_short = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"]
+    
+    # Tüm ayı bir takvim olarak göster
+    for week_idx, week in enumerate(calendar_data):
+        cols = st.columns(7, gap="small")
+        
+        for col_idx, col in enumerate(cols):
+            day = week[col_idx]
+            day_name = day_names_short[col_idx]
+            
+            if day is None:
+                col.write("")
+            else:
+                with col:
+                    date_display = day.strftime("%d").upper()
+                    is_weekend = day.weekday() >= 5
+                    
+                    # Session state'ten veya existing_map'ten al
+                    if day in st.session_state.talep_selections:
+                        prev_val = st.session_state.talep_selections[day]
+                    elif day in existing_map:
+                        prev_val = existing_map[day]
+                    else:
+                        prev_val = "CALISABILIR"
+                    
+                    prev_idx = TAL_EP_SECENEKLERI.index(prev_val) if prev_val in TAL_EP_SECENEKLERI else 0
+                    
+                    # Benzersiz key
+                    key = f"talep_{selected_name}_{year}_{month}_{day}"
+                    
+                    # Başlık stilini gün türüne göre yap
+                    if is_weekend:
+                        st.markdown(f"""
+                        <div style='
+                            background: linear-gradient(135deg, #ff9999 0%, #ffcccc 100%);
+                            padding: 6px;
+                            border-radius: 6px;
+                            text-align: center;
+                            border: 1px solid #ff6666;
+                            margin-bottom: 5px;
+                        '>
+                            <b style='color: white; font-size: 11px;'>{day_name}</b><br/>
+                            <b style='color: white; font-size: 14px;'>{date_display}</b>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style='
+                            background: linear-gradient(135deg, #99ccff 0%, #cce5ff 100%);
+                            padding: 6px;
+                            border-radius: 6px;
+                            text-align: center;
+                            border: 1px solid #6699ff;
+                            margin-bottom: 5px;
+                        '>
+                            <b style='color: white; font-size: 11px;'>{day_name}</b><br/>
+                            <b style='color: white; font-size: 14px;'>{date_display}</b>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Kompakt seçim dropdown'u
+                    talep = st.selectbox(
+                        "Durum",
+                        options=TAL_EP_SECENEKLERI,
+                        format_func=lambda x: TAL_EP_DISPLAY[TAL_EP_SECENEKLERI.index(x)],
+                        index=prev_idx,
+                        key=key,
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Session state'e kaydet
+                    st.session_state.talep_selections[day] = talep
+
+    # Kaydet butonu
+    st.markdown("---")
+    
+    if st.button("✅ Taleplerimi Kaydet", use_container_width=True, key="save_button_final"):
+        # Yeniden yükle (güncel veriler için)
+        requests_df = load_requests()
+        
+        # Önce bu kişinin bu ayki eski kayıtlarını sil
+        requests_df = requests_df[~(
+            (requests_df["ad_soyad"] == selected_name) &
+            (requests_df["yil"] == year) &
+            (requests_df["ay"] == month)
+        )]
+        
+        new_records = []
+        for day in all_days:
+            talep_tipi = st.session_state.talep_selections.get(day, "CALISABILIR")
+            
+            new_records.append({
+                "ad_soyad": selected_name,
+                "yil": int(year),
+                "ay": int(month),
+                "tarih": pd.to_datetime(day),
+                "talep_tipi": talep_tipi
+            })
+        
+        # Yeni kayıtları ekle
+        new_df = pd.DataFrame(new_records)
+        requests_df = pd.concat([requests_df, new_df], ignore_index=True)
+        save_requests(requests_df)
+        
+        # Kaydettikten sonra session state'i sıfırla
+        st.session_state.talep_selections = {}
+        
+        st.success("✅ Talepler başarıyla kaydedildi!")
+        st.balloons()
+
+    st.markdown("---")
+    st.subheader("📋 Diğer Çalışanların Talepleri (bu ay)")
+    show_others = st.checkbox("Diğer çalışanların taleplerini göster", value=False)
+    if show_others:
+        requests_df = load_requests()
+        others = requests_df[
+            (requests_df["yil"] == year) &
+            (requests_df["ay"] == month)
+        ]
+        if not others.empty:
+            pivot_others = others.copy()
+            pivot_others["tarih"] = pivot_others["tarih"].dt.strftime("%d %b")
+            pivot_table = pivot_others.pivot_table(
+                index='ad_soyad',
+                columns='tarih',
+                values='talep_tipi',
+                aggfunc='first'
+            )
+            st.dataframe(pivot_table, use_container_width=True, height=min(400, len(pivot_table) * 35 + 40))
+        else:
+            st.info("Bu ay için henüz talep kaydı yok.")
+
+
+# ===================== YÖNETİCİ MODU ===================== #
+
+else:
+    st.header("🔧 Yönetici Planlama ve Optimizasyon")
+
+    if employees_df.empty:
+        st.error("Çalışan listesi (employees.csv) boş. Lütfen önce çalışanları tanımla.")
+        st.stop()
+
+    col_y, col_m = st.columns(2)
+    year = col_y.number_input("Yıl", min_value=2024, max_value=2100, value=date.today().year, step=1)
+    month = col_m.selectbox(
+        "Ay", options=range(1, 13),
+        format_func=lambda x: calendar.month_name[x],
+        index=date.today().month - 1
+    )
+
+    required_per_day = st.number_input("Günlük Gerekli Kişi Sayısı", value=5, min_value=1)
+
+    all_days = get_all_days_of_month(year, month)
+    all_days_dt = [datetime.combine(d, datetime.min.time()) for d in all_days]
+
+    # Her açılışta requests_df'i yeniden yükle
+    requests_df = load_requests()
+    
+    # 1) Talepleri oku ve plan_df formatına çevir
+    req_period = requests_df[(requests_df["yil"] == year) & (requests_df["ay"] == month)]
+    
+    if req_period.empty:
+        st.warning("⚠️ Bu ay için henüz talep girilmemiş.")
+    else:
+        # Tüm çalışanların olduğundan emin ol
+        people = employees_df["ad_soyad"].tolist()
+        recs = []
+
+        for p in people:
+            row = {"AD SOYAD": p}
+            for d in all_days_dt:
+                mask = (req_period["ad_soyad"] == p) & (req_period["tarih"] == d.date())
+                if mask.any():
+                    ttype = req_period.loc[mask, "talep_tipi"].iloc[0]
+                else:
+                    ttype = "CALISABILIR"
+                # Mevcut modeline uysun diye metinlere dönüştürelim
+                if ttype == "CALISABILIR":
+                    val = "çalışırım"
+                elif ttype == "CALISAMAZ":
+                    val = "çalışamam"
+                elif ttype == "YILLIK_IZIN":
+                    val = "izin"
+                elif ttype == "EGITIM":
+                    val = "eğitim"
+                else:
+                    val = ""
+                col_name = d
+                row[col_name] = val
+            recs.append(row)
+
+        plan_df = pd.DataFrame(recs)
+
+        st.subheader("📊 Taleplerin Özet Görünümü (Ham Veri)")
+        st.dataframe(plan_df, use_container_width=True)
+
+        # 2) Gruplar ve yıllık mesai bilgisi
+        group_map = dict(zip(employees_df["ad_soyad"], employees_df["grup"]))
+        mesai_map = dict(zip(employees_df["ad_soyad"], employees_df["yillik_mesai_saat"]))
+
+        # 3) Optimizasyon butonu
+        if st.button("🚀 Optimizasyonu Çalıştır"):
+            with st.spinner("Model optimize ediliyor..."):
+
+                people = employees_df["ad_soyad"].tolist()
+                d_range = range(len(all_days_dt))
+
+                # Talep puanlaması
+                pref_penalty = {}
+                for p in people:
+                    row = plan_df[plan_df["AD SOYAD"] == p]
+                    for d_idx, date_val in enumerate(all_days_dt):
+                        if not row.empty:
+                            val = str(row.iloc[0][date_val]).lower()
+                        else:
+                            val = ""
+                        if "çalışırım" in val or "calisirim" in val:
+                            pref_penalty[p, d_idx] = -100
+                        elif any(k in val for k in ["çalışamam", "calisamam", "izin", "eğitim", "egitim", "mazeret"]):
+                            pref_penalty[p, d_idx] = 999999
+                        else:
+                            pref_penalty[p, d_idx] = 0
+
+                # Model
+                prob = LpProblem("Sade_Mesai_Modeli", LpMinimize)
+                x = LpVariable.dicts("x", (people, d_range), cat='Binary')
+                dev = LpVariable.dicts("dev", people, lowBound=0)
+                group_slack = LpVariable.dicts("g_slack", (d_range, ["GRUP 1", "GRUP 2", "GRUP 3", "GRUP 4"]), lowBound=0)
+                justice_slack = LpVariable.dicts("j_slack", people, lowBound=0)
+
+                # A: Günlük kişi sayısı
+                for d_idx in d_range:
+                    prob += lpSum([x[p][d_idx] for p in people]) == required_per_day
+
+                # B: Hafta sonu ardışık blok
+                for p in people:
+                    for i in range(len(all_days_dt) - 1):
+                        curr = all_days_dt[i]
+                        nxt = all_days_dt[i + 1]
+                        if (nxt - curr).days == 1 and curr.weekday() == 5 and nxt.weekday() == 6:
+                            prob += x[p][i] == x[p][i + 1]
+
+                # C: Grup limitleri (yumuşak)
+                base_limits = {"GRUP 1": 1, "GRUP 2": 2, "GRUP 3": 2, "GRUP 4": 1}
+                for d_idx in d_range:
+                    for g, lim in base_limits.items():
+                        prob += lpSum([x[p][d_idx] for p in people if group_map.get(p) == g]) <= lim + group_slack[d_idx][g]
+
+                # D: Mesai dengesi
+                toplam_saat = sum(auto_get_hours(d.date()) for d in all_days_dt) * required_per_day
+                hedef_ort = np.mean(list(mesai_map.values())) + (toplam_saat / len(people))
+
+                for p in people:
+                    p_toplam = mesai_map[p] + lpSum([x[p][d_idx] * auto_get_hours(all_days_dt[d_idx].date()) for d_idx in d_range])
+                    prob += dev[p] >= p_toplam - hedef_ort
+                    prob += dev[p] >= hedef_ort - p_toplam
+                    prob += lpSum([x[p][d_idx] for d_idx in d_range]) + justice_slack[p] >= 2
+
+                prob += (
+                    lpSum([dev[p] for p in people]) * 10 +
+                    lpSum([pref_penalty[p, d_idx] * x[p][d_idx] for p in people for d_idx in d_range]) +
+                    lpSum([group_slack[d_idx][g] * 100000 for d_idx in d_range for g in base_limits]) +
+                    lpSum([justice_slack[p] * 200000 for p in people])
+                )
+
+                try:
+                    prob.solve(PULP_CBC_CMD(msg=False, timeLimit=30))
+                    if LpStatus[prob.status] in ['Optimal', 'Unbounded']:
+                        res_rows = []
+                        for p in people:
+                            r = {"AD SOYAD": p}
+                            for d_idx, date_val in enumerate(all_days_dt):
+                                r[date_val.strftime('%d-%m (%a)')] = "NÖBET" if value(x[p][d_idx]) > 0.5 else ""
+                            res_rows.append(r)
+                        df_plan = pd.DataFrame(res_rows)
+
+                        st.success("✅ Plan oluşturuldu. Aşağıdan inceleyip düzenleyebilirsiniz.")
+                        
+                        st.session_state.df_plan = df_plan
+                        st.session_state.optimized = True
+
+                except Exception as e:
+                    st.error(f"❌ Çözücü hatası: {e}")
+
+        # Önceki optimizasyondan plan varsa göster
+        if "df_plan" in st.session_state and st.session_state.get("optimized"):
+            df_plan = st.session_state.df_plan
+            
+            edited_df = st.data_editor(df_plan, use_container_width=True, key="plan_editor")
+
+            # Mesai özeti - HER SEFERINDE RECALCULATE
+            st.subheader("📈 Mesai Özeti")
+            summary = []
+            for p in people:
+                p_row = edited_df[edited_df["AD SOYAD"] == p]
+                bu_ay_saat = 0
+                nobet_gun = 0
+                if not p_row.empty:
+                    for d_idx, date_val in enumerate(all_days_dt):
+                        col = date_val.strftime('%d-%m (%a)')
+                        if col in p_row.columns and str(p_row.iloc[0][col]).strip().upper() == "NÖBET":
+                            bu_ay_saat += auto_get_hours(date_val.date())
+                            nobet_gun += 1
+                summary.append({
+                    "AD SOYAD": p,
+                    "Grup": group_map.get(p),
+                    "Eski Mesai": mesai_map[p],
+                    "Bu Ay Mesai": bu_ay_saat,
+                    "Yeni Toplam": mesai_map[p] + bu_ay_saat,
+                    "Nöbet Günü": nobet_gun
+                })
+            df_sum = pd.DataFrame(summary).sort_values("Yeni Toplam")
+            st.dataframe(df_sum, use_container_width=True)
+
+            # Kaydet ve İndir butonları
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if st.button("💾 Bu planı assignments.csv'ye kaydet"):
+                    # Yeniden dosyayı yükle
+                    assign_df_current = load_assignments()
+                    
+                    # Önce bu yıl/ay için eski atamaları sil
+                    assign_clean = assign_df_current[~(
+                        (assign_df_current["yil"] == year) &
+                        (assign_df_current["ay"] == month)
+                    )]
+
+                    new_assign = []
+                    for p in people:
+                        p_row = edited_df[edited_df["AD SOYAD"] == p]
+                        if not p_row.empty:
+                            for d_idx, date_val in enumerate(all_days_dt):
+                                col = date_val.strftime('%d-%m (%a)')
+                                if col in p_row.columns and str(p_row.iloc[0][col]).strip().upper() == "NÖBET":
+                                    new_assign.append({
+                                        "ad_soyad": p,
+                                        "yil": int(year),
+                                        "ay": int(month),
+                                        "tarih": date_val.date(),
+                                        "gorev_tipi": "NOBET"
+                                    })
+                    
+                    if new_assign:
+                        new_assign_df = pd.DataFrame(new_assign)
+                        final_assign = pd.concat([assign_clean, new_assign_df], ignore_index=True)
+                        save_assignments(final_assign)
+                        st.success("✅ Plan assignments.csv dosyasına kaydedildi!")
+                        st.balloons()
+                    else:
+                        st.warning("⚠️ Kayıt yapılacak nöbet yok.")
+
+            with col2:
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    edited_df.to_excel(writer, sheet_name="Nobet_Plani", index=False)
+                    df_sum.to_excel(writer, sheet_name="Ozet", index=False)
+                
+                st.download_button(
+                    label="📥 Excel'e aktar",
+                    data=output.getvalue(),
+                    file_name=f"{month}_{year}_Nobet_Plani.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
+            with col3:
+                if st.button("🔄 Yeni optimizasyon"):
+                    st.session_state.optimized = False
+                    st.rerun()
+
+        st.markdown("---")
+        st.subheader("📂 Mevcut assignments.csv (sadece bilgi amaçlı)")
+        
+        # Her açılışta assignments'ı yeniden yükle
+        assign_df_current = load_assignments()
+        
+        if not assign_df_current.empty:
+            view_assign = assign_df_current[
+                (assign_df_current["yil"] == year) &
+                (assign_df_current["ay"] == month)
+            ].sort_values(["ad_soyad", "tarih"])
+            if not view_assign.empty:
+                st.dataframe(view_assign, use_container_width=True)
+            else:
+                st.info("Bu ay için henüz atama yapılmamış.")
+        else:
+            st.info("assignments.csv dosyası boş.")
